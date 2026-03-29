@@ -1,58 +1,61 @@
 ---
 name: pumpperps-trader
-description: Use this skill to monitor PumpPerps markets, place and close positions through PumpPerps web API routes, and run a self-improving trading loop that tunes leverage and risk from recent trade outcomes.
+description: Use this skill to activate immediate paper trading on PumpPerps, continuously self-improve strategy settings from trade history, and only switch to live trading after explicit user confirmation plus wallet/session credentials.
 ---
 
 # PumpPerps Trader
 
-Use this skill when the user asks to automate or semi-automate trading on PumpPerps.
+Use this skill when the user asks to automate or run trading on PumpPerps.
 
-## Safety Defaults
+## Required Behavior
 
-- Default to `--dry-run` unless the user explicitly asks for live orders.
-- Never execute live trades without a valid authenticated session cookie.
-- Confirm max risk settings before increasing position size or leverage.
+- Always start in paper mode on activation.
+- Always run self-improvement after each cycle.
+- Never place live orders unless the user explicitly says to trade live.
+- If wallet/session details are missing, ask for them in chat using the prompt templates below.
 
-## Required Runtime Inputs
+## Activation Flow (Run Immediately)
 
-- `PUMPPERPS_BASE_URL` (optional, default `https://pumpperps.com`)
-- `PUMPPERPS_COOKIE` (required for authenticated trade operations)
-- `PUMPPERPS_WALLET` (required for placing/closing positions)
-
-## Core Workflow
-
-1. Run preflight validation:
+1. Validate setup:
    - `python3 scripts/quick_validate.py`
-2. Pull market universe from `/api/pools`.
-3. Score candidates using 24h volume, open interest imbalance, and recent price momentum.
-4. Size position using configured risk budget.
-5. Place order (`POST /api/positions`) unless `--dry-run`.
-6. Evaluate open positions and close with rules (`DELETE /api/positions/:id?wallet=...`).
-7. Persist outcomes in `data/trade_history.jsonl`.
-8. Run parameter adaptation (`scripts/trader_loop.py --improve-only`) to update:
-   - `max_leverage`
-   - `risk_per_trade_bps`
-   - `min_signal_score`
+2. Start immediate paper trading cycle:
+   - `python3 scripts/trader_loop.py --cycles 1`
+3. If user wants continuous paper mode, run:
+   - `python3 scripts/trader_loop.py --cycles 9999 --sleep-seconds 15`
 
-## Self-Improvement Rules
+## Chat Prompts For Missing Info
 
-- Use only the last `N` closed trades (default `30`) for adaptation.
-- If rolling win rate drops below target, reduce `max_leverage` by 1 and lower risk by 10%.
-- If rolling win rate exceeds target and drawdown is controlled, increase `max_leverage` by 1 (up to cap) and raise risk by 5%.
-- Persist current strategy in `data/strategy_state.json`.
-- Never mutate parameters by more than one step per cycle.
+Use these exact prompts when details are missing:
 
-## Commands
+- Missing wallet:
+  - `Send your Solana public wallet address (base58 public key only, not private key).`
+- Missing session cookie for future live mode:
+  - `When ready for live mode, send your PumpPerps session cookie string for authenticated API calls.`
+- Before any live trade:
+  - `Confirm live trading: reply exactly 'GO LIVE' to allow real-money order placement.`
 
-- Dry-run loop:
-  - `python3 scripts/trader_loop.py --dry-run --cycles 1`
-- Live loop (requires authenticated cookie):
-  - `python3 scripts/trader_loop.py --cycles 1`
-- Improve parameters only:
-  - `python3 scripts/trader_loop.py --improve-only`
+## Live Trading Gate
 
-## Notes
+Only after explicit confirmation and credentials:
 
-- PumpPerps appears to use cookie-based auth on same-origin `/api/*` routes.
-- This skill does not bypass authentication; it expects a valid user session cookie.
-- If endpoints or payload shape change, update `scripts/trader_loop.py` route handlers.
+1. User confirms with `GO LIVE`.
+2. Wallet public key is provided and valid.
+3. Session cookie is provided.
+4. Run live mode:
+   - `python3 scripts/trader_loop.py --live --cycles 1`
+
+## Self-Improvement
+
+- Uses recent closed trades from `data/trade_history.jsonl`.
+- Updates and persists strategy values in `data/strategy_state.json`:
+  - `max_leverage`
+  - `risk_per_trade_bps`
+  - `min_signal_score`
+- Runs every cycle, including paper cycles.
+
+## Safety
+
+- Default mode is paper mode.
+- `--live` is required for real order placement.
+- Invalid wallet input in paper mode is ignored and replaced with a placeholder wallet.
+- Live mode rejects invalid wallet or missing cookie.

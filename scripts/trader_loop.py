@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 STATE_PATH = DATA_DIR / "strategy_state.json"
 HISTORY_PATH = DATA_DIR / "trade_history.jsonl"
+POOLS_CACHE_PATH = DATA_DIR / "pools_cache.json"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+PAPER_WALLET = "PAPER_TRADING_WALLET"
 
 
 def now_iso() -> str:
@@ -27,7 +29,7 @@ def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
         return json.load(f)
 
 
-def save_json(path: Path, payload: Dict[str, Any]) -> None:
+def save_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -62,9 +64,15 @@ def request_json(
     method: str = "GET",
     body: Optional[Dict[str, Any]] = None,
     cookie: Optional[str] = None,
+    timeout_seconds: float = 20.0,
+    retries: int = 2,
+    backoff_seconds: float = 1.25,
 ) -> Any:
     url = base_url.rstrip("/") + route
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "pumpperps-trader-skill/1.1",
+    }
     payload = None
     if body is not None:
         payload = json.dumps(body).encode("utf-8")
@@ -72,18 +80,31 @@ def request_json(
     if cookie:
         headers["Cookie"] = cookie
 
-    req = request.Request(url, data=payload, headers=headers, method=method)
-    try:
-        with request.urlopen(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else None
-    except error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} {method} {route}: {raw[:400]}") from exc
-    except TimeoutError as exc:
-        raise RuntimeError(f"Timeout for {method} {route}: {exc}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"Network error for {method} {route}: {exc}") from exc
+    retryable_status = {408, 425, 429, 500, 502, 503, 504}
+    max_attempts = max(1, int(retries) + 1)
+
+    for attempt in range(max_attempts):
+        req = request.Request(url, data=payload, headers=headers, method=method)
+        try:
+            with request.urlopen(req, timeout=timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else None
+        except error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            can_retry = exc.code in retryable_status and attempt < (max_attempts - 1)
+            if can_retry:
+                time.sleep(backoff_seconds * (2**attempt))
+                continue
+            raise RuntimeError(f"HTTP {exc.code} {method} {route}: {raw[:400]}") from exc
+        except (TimeoutError, error.URLError) as exc:
+            if attempt < (max_attempts - 1):
+                time.sleep(backoff_seconds * (2**attempt))
+                continue
+            if isinstance(exc, TimeoutError):
+                raise RuntimeError(f"Timeout for {method} {route}: {exc}") from exc
+            raise RuntimeError(f"Network error for {method} {route}: {exc}") from exc
+
+    raise RuntimeError(f"Failed {method} {route} after {max_attempts} attempts")
 
 
 def decode_base58(value: str) -> bytes:
@@ -191,21 +212,51 @@ def improve(state: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, A
     return state
 
 
-def get_pools(base_url: str) -> List[Dict[str, Any]]:
+def get_pools(base_url: str, request_timeout: float, request_retries: int) -> List[Dict[str, Any]]:
     try:
-        data = request_json(base_url, "/api/pools", "GET")
+        data = request_json(
+            base_url,
+            "/api/pools",
+            "GET",
+            timeout_seconds=request_timeout,
+            retries=request_retries,
+        )
     except RuntimeError as exc:
         print(f"failed to fetch pools: {exc}")
+        if POOLS_CACHE_PATH.exists():
+            try:
+                with POOLS_CACHE_PATH.open("r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if isinstance(cached, list):
+                    print("using cached pools data")
+                    return [x for x in cached if isinstance(x, dict)]
+            except (OSError, json.JSONDecodeError):
+                pass
         return []
 
     if not isinstance(data, list):
         return []
+
+    save_json(POOLS_CACHE_PATH, data)
     return [x for x in data if isinstance(x, dict)]
 
 
-def get_positions(base_url: str, wallet: str, cookie: Optional[str]) -> List[Dict[str, Any]]:
+def get_positions(
+    base_url: str,
+    wallet: str,
+    cookie: Optional[str],
+    request_timeout: float,
+    request_retries: int,
+) -> List[Dict[str, Any]]:
     route = f"/api/positions/{parse.quote(wallet)}"
-    data = request_json(base_url, route, "GET", cookie=cookie)
+    data = request_json(
+        base_url,
+        route,
+        "GET",
+        cookie=cookie,
+        timeout_seconds=request_timeout,
+        retries=request_retries,
+    )
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict) and isinstance(data.get("positions"), list):
@@ -213,9 +264,16 @@ def get_positions(base_url: str, wallet: str, cookie: Optional[str]) -> List[Dic
     return []
 
 
-def maybe_close_positions(base_url: str, wallet: str, cookie: str, dry_run: bool) -> int:
+def maybe_close_positions(
+    base_url: str,
+    wallet: str,
+    cookie: str,
+    dry_run: bool,
+    request_timeout: float,
+    request_retries: int,
+) -> int:
     closed = 0
-    positions = get_positions(base_url, wallet, cookie)
+    positions = get_positions(base_url, wallet, cookie, request_timeout, request_retries)
     for p in positions:
         position_id = p.get("id") or p.get("positionId")
         pnl_bps = float(p.get("pnlBps") or p.get("pnl_bps") or 0.0)
@@ -226,9 +284,16 @@ def maybe_close_positions(base_url: str, wallet: str, cookie: str, dry_run: bool
             continue
         route = f"/api/positions/{parse.quote(str(position_id))}?wallet={parse.quote(wallet)}"
         if dry_run:
-            print(f"[dry-run] close position id={position_id} pnl_bps={pnl_bps}")
+            print(f"[paper] close position id={position_id} pnl_bps={pnl_bps}")
         else:
-            request_json(base_url, route, "DELETE", cookie=cookie)
+            request_json(
+                base_url,
+                route,
+                "DELETE",
+                cookie=cookie,
+                timeout_seconds=request_timeout,
+                retries=request_retries,
+            )
             print(f"closed position id={position_id} pnl_bps={pnl_bps}")
         closed += 1
     return closed
@@ -243,10 +308,10 @@ def resolve_pool_id(base_url: str, candidate: Dict[str, Any]) -> Optional[str]:
 
     token_mint = candidate.get("tokenMint") or candidate.get("mint")
     if token_mint is not None and str(token_mint).strip() != "":
-        # In observed PumpPerps payloads tokenMint is always present; use it as a stable fallback.
         return str(token_mint)
 
     return None
+
 
 def open_position(
     base_url: str,
@@ -255,6 +320,8 @@ def open_position(
     candidate: Dict[str, Any],
     state: Dict[str, Any],
     dry_run: bool,
+    request_timeout: float,
+    request_retries: int,
 ) -> None:
     collateral = round(max(5.0, float(state.get("risk_per_trade_bps", 100)) / 10.0), 2)
     leverage = int(state.get("max_leverage", 3))
@@ -262,10 +329,7 @@ def open_position(
     pool_id = resolve_pool_id(base_url, candidate)
 
     if not pool_id:
-        raise RuntimeError(
-            "Could not resolve poolId for selected candidate. "
-            "Check /api/pools payload shape and /api/lookup response."
-        )
+        raise RuntimeError("Could not resolve poolId for selected candidate")
 
     payload = {
         "wallet": wallet,
@@ -277,18 +341,26 @@ def open_position(
     }
 
     if dry_run:
-        print("[dry-run] open position payload=", json.dumps(payload, sort_keys=True))
+        print("[paper] open position payload=", json.dumps(payload, sort_keys=True))
         return
 
     if not cookie:
         raise RuntimeError("PUMPPERPS_COOKIE is required for live trade execution")
 
-    response = request_json(base_url, "/api/positions", "POST", payload, cookie=cookie)
+    response = request_json(
+        base_url,
+        "/api/positions",
+        "POST",
+        payload,
+        cookie=cookie,
+        timeout_seconds=request_timeout,
+        retries=request_retries,
+    )
     print("opened position:", json.dumps(response, sort_keys=True)[:600])
 
 
-def cycle(args: argparse.Namespace, state: Dict[str, Any]) -> None:
-    pools = get_pools(args.base_url)
+def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wallet: str) -> None:
+    pools = get_pools(args.base_url, args.request_timeout, args.request_retries)
     if not pools:
         print("no pools returned from API")
         return
@@ -307,15 +379,24 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any]) -> None:
 
     open_position(
         base_url=args.base_url,
-        wallet=args.wallet,
+        wallet=wallet,
         cookie=args.cookie,
         candidate=candidate,
         state=state,
-        dry_run=args.dry_run,
+        dry_run=paper_mode,
+        request_timeout=args.request_timeout,
+        request_retries=args.request_retries,
     )
 
     if args.cookie:
-        maybe_close_positions(args.base_url, args.wallet, args.cookie, args.dry_run)
+        maybe_close_positions(
+            args.base_url,
+            wallet,
+            args.cookie,
+            paper_mode,
+            args.request_timeout,
+            args.request_retries,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -325,7 +406,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wallet", default=os.getenv("PUMPPERPS_WALLET", ""))
     parser.add_argument("--cycles", type=int, default=1)
     parser.add_argument("--sleep-seconds", type=int, default=5)
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--request-timeout", type=float, default=20.0)
+    parser.add_argument("--request-retries", type=int, default=2)
+    parser.add_argument("--live", action="store_true", help="Enable live order placement")
+    parser.add_argument("--dry-run", action="store_true", help="Force paper mode even when --live is passed")
     parser.add_argument("--improve-only", action="store_true")
     parser.add_argument("--record-sample", action="store_true", help="append a synthetic closed trade sample for testing adaptation")
     return parser.parse_args()
@@ -366,21 +450,32 @@ def main() -> int:
         print("improved strategy state:", json.dumps(new_state, indent=2, sort_keys=True))
         return 0
 
-    if not args.wallet:
-        raise RuntimeError("PUMPPERPS_WALLET (or --wallet) is required")
+    paper_mode = (not args.live) or args.dry_run
 
-    if not is_probably_solana_pubkey(args.wallet):
-        raise RuntimeError(
-            "PUMPPERPS_WALLET must be a Solana public address (base58, 32-byte). "
-            "Do not pass a private key or seed value."
-        )
+    wallet = args.wallet.strip()
+    if paper_mode:
+        if wallet and not is_probably_solana_pubkey(wallet):
+            print("paper mode: ignoring invalid wallet string and using placeholder wallet")
+            wallet = PAPER_WALLET
+        elif not wallet:
+            wallet = PAPER_WALLET
+            print("paper mode: no wallet provided, using placeholder wallet")
+    else:
+        if not wallet:
+            raise RuntimeError("PUMPPERPS_WALLET (or --wallet) is required for live trading")
+        if not is_probably_solana_pubkey(wallet):
+            raise RuntimeError(
+                "PUMPPERPS_WALLET must be a Solana public address (base58, 32-byte). "
+                "Do not pass a private key or seed value."
+            )
+        if not args.cookie:
+            raise RuntimeError("PUMPPERPS_COOKIE (or --cookie) is required for live trading")
 
-    if not args.dry_run and not args.cookie:
-        raise RuntimeError("PUMPPERPS_COOKIE (or --cookie) is required for live mode")
+    print(f"mode={'paper' if paper_mode else 'live'}")
 
     for i in range(max(1, args.cycles)):
         print(f"cycle {i + 1}/{args.cycles} @ {now_iso()}")
-        cycle(args, state)
+        cycle(args, state, paper_mode, wallet)
         time.sleep(max(args.sleep_seconds, 0))
 
     new_state = improve(state, load_history(HISTORY_PATH))
