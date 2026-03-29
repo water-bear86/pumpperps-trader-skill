@@ -42,6 +42,22 @@ python3 scripts/trader_loop.py --cycles 1
 python3 scripts/trader_loop.py --cycles 9999 --sleep-seconds 15
 ```
 
+### Long-run paper mode notes
+
+During long paper runs, `/api/pools` may intermittently time out. This is expected and non-fatal.
+
+- The loop continues on the next cycle.
+- If cached pools are available, they are used automatically.
+- Strategy self-improvement still persists each run.
+
+Recommended long-run command:
+
+```bash
+python3 scripts/trader_loop.py --cycles 1000 --sleep-seconds 10 --request-timeout 6 --request-retries 1
+```
+
+Stop safely with `Ctrl+C` and restart with the same command.
+
 ### Live mode example
 
 ```bash
@@ -98,7 +114,9 @@ python3 scripts/trader_loop.py --improve-only
 ### Operational notes
 
 - Network failures are handled with retry/backoff.
+- If `/api/pools` times out during long runs, the cycle logs the failure and continues.
 - If pool fetch fails and cache exists, cached pools are used.
+- Long-run paper trading should use explicit timeout/retry flags.
 - Outputs are intentionally concise and machine-parsable where possible.
 
 ## Disclaimer
