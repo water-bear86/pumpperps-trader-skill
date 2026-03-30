@@ -49,8 +49,8 @@ Only after explicit confirmation and credentials:
 - Uses recent realized closed trades from `data/trade_history.jsonl`.
 - Paper positions persist in `data/paper_positions.json` and close via TP/SL/time-stop rules.
 - Updates and persists strategy values in `data/strategy_state.json`:
+  - `risk_per_trade_bps` is computed using fractional Kelly sizing on realized outcomes.
   - `max_leverage`
-  - `risk_per_trade_bps`
   - `min_signal_score`
 - Runs every cycle, including paper cycles.
 
@@ -71,3 +71,11 @@ Preconfigure these flags/env vars before running paper mode:
 - `--paper-take-profit-bps`
 - `--paper-stop-loss-bps`
 - `--paper-noise-bps`
+
+## Kelly Controls
+
+Tune Kelly sizing with:
+
+- `--kelly-fraction`
+- `--min-risk-bps`
+- `--max-risk-bps`

@@ -210,30 +210,56 @@ def improve(state: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, A
     target_win_rate = float(state.get("target_win_rate", 0.55))
     max_dd_bps = float(state.get("max_drawdown_bps", 1200))
 
+    kelly_fraction = clamp(float(state.get("kelly_fraction", 0.25)), 0.0, 1.0)
+    min_risk_bps = max(1.0, float(state.get("min_risk_bps", 25.0)))
+    max_risk_bps = max(min_risk_bps, float(state.get("max_risk_bps", 1000.0)))
+
     closed = [x for x in history if x.get("status") == "closed"]
     sample = closed[-lookback:]
     if len(sample) < 5:
         state["updated_at"] = now_iso()
+        state["kelly_fraction"] = round(kelly_fraction, 4)
+        state["min_risk_bps"] = round(min_risk_bps, 2)
+        state["max_risk_bps"] = round(max_risk_bps, 2)
         return state
 
-    wins = sum(1 for x in sample if float(x.get("pnl_usd", 0.0)) > 0)
-    win_rate = wins / len(sample)
-    avg_pnl_bps = sum(float(x.get("pnl_bps", 0.0)) for x in sample) / len(sample)
-    worst_pnl_bps = min(float(x.get("pnl_bps", 0.0)) for x in sample)
+    pnl_bps_values = [safe_float(x.get("pnl_bps"), 0.0) for x in sample]
+    wins_bps = [x for x in pnl_bps_values if x > 0.0]
+    losses_bps_abs = [abs(x) for x in pnl_bps_values if x < 0.0]
+
+    win_rate = len(wins_bps) / len(sample)
+    avg_pnl_bps = sum(pnl_bps_values) / len(pnl_bps_values)
+    worst_pnl_bps = min(pnl_bps_values)
+    avg_win_bps = sum(wins_bps) / len(wins_bps) if wins_bps else 0.0
+    avg_loss_bps_abs = sum(losses_bps_abs) / len(losses_bps_abs) if losses_bps_abs else 0.0
+
+    payoff_ratio = (avg_win_bps / avg_loss_bps_abs) if avg_loss_bps_abs > 0 else 0.0
+    if payoff_ratio > 0:
+        kelly_full = win_rate - ((1.0 - win_rate) / payoff_ratio)
+    else:
+        kelly_full = 0.0
+    kelly_full = clamp(kelly_full, -1.0, 1.0)
+
+    kelly_fractional = max(0.0, kelly_full) * kelly_fraction
+    kelly_risk_bps = clamp(kelly_fractional * 10000.0, min_risk_bps, max_risk_bps)
 
     max_leverage = int(state.get("max_leverage", 3))
-    risk_bps = float(state.get("risk_per_trade_bps", 100))
+    current_risk_bps = float(state.get("risk_per_trade_bps", 100))
     signal = float(state.get("min_signal_score", 0.55))
+    risk_bps = kelly_risk_bps
 
     if win_rate < target_win_rate or worst_pnl_bps < -max_dd_bps:
         max_leverage = max(1, max_leverage - 1)
-        risk_bps = clamp(risk_bps * 0.90, 25, 1000)
+        risk_bps = clamp(min(risk_bps, current_risk_bps * 0.9), min_risk_bps, max_risk_bps)
         signal = clamp(signal + 0.03, 0.40, 0.95)
     elif win_rate >= target_win_rate and avg_pnl_bps > 0 and worst_pnl_bps > -(max_dd_bps * 0.7):
         max_leverage = min(10, max_leverage + 1)
-        risk_bps = clamp(risk_bps * 1.05, 25, 1000)
+        risk_bps = clamp((current_risk_bps * 0.4) + (risk_bps * 0.6), min_risk_bps, max_risk_bps)
         signal = clamp(signal - 0.02, 0.35, 0.95)
 
+    state["kelly_fraction"] = round(kelly_fraction, 4)
+    state["min_risk_bps"] = round(min_risk_bps, 2)
+    state["max_risk_bps"] = round(max_risk_bps, 2)
     state["max_leverage"] = int(max_leverage)
     state["risk_per_trade_bps"] = round(float(risk_bps), 2)
     state["min_signal_score"] = round(float(signal), 4)
@@ -243,6 +269,12 @@ def improve(state: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, A
         "win_rate": round(win_rate, 4),
         "avg_pnl_bps": round(avg_pnl_bps, 2),
         "worst_pnl_bps": round(worst_pnl_bps, 2),
+        "avg_win_bps": round(avg_win_bps, 2),
+        "avg_loss_bps_abs": round(avg_loss_bps_abs, 2),
+        "payoff_ratio": round(payoff_ratio, 4),
+        "kelly_full": round(kelly_full, 4),
+        "kelly_fractional": round(kelly_fractional, 4),
+        "kelly_risk_bps": round(kelly_risk_bps, 2),
     }
     return state
 
@@ -795,6 +827,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-timeout", type=float, default=float(os.getenv("PERPCRAB_LLM_TIMEOUT", os.getenv("PUMPCRAB_LLM_TIMEOUT", "25"))))
     parser.add_argument("--llm-candidate-count", type=int, default=int(os.getenv("PERPCRAB_LLM_CANDIDATE_COUNT", os.getenv("PUMPCRAB_LLM_CANDIDATE_COUNT", "12"))))
 
+    parser.add_argument("--kelly-fraction", type=float, default=float(os.getenv("PERPCRAB_KELLY_FRACTION", os.getenv("PUMPCRAB_KELLY_FRACTION", "0.25"))))
+    parser.add_argument("--min-risk-bps", type=float, default=float(os.getenv("PERPCRAB_MIN_RISK_BPS", os.getenv("PUMPCRAB_MIN_RISK_BPS", "25"))))
+    parser.add_argument("--max-risk-bps", type=float, default=float(os.getenv("PERPCRAB_MAX_RISK_BPS", os.getenv("PUMPCRAB_MAX_RISK_BPS", "1000"))))
+
     parser.add_argument("--paper-max-open-positions", type=int, default=int(os.getenv("PERPCRAB_PAPER_MAX_OPEN_POSITIONS", os.getenv("PUMPCRAB_PAPER_MAX_OPEN_POSITIONS", "3"))))
     parser.add_argument("--paper-min-hold-seconds", type=float, default=float(os.getenv("PERPCRAB_PAPER_MIN_HOLD_SECONDS", os.getenv("PUMPCRAB_PAPER_MIN_HOLD_SECONDS", "90"))))
     parser.add_argument("--paper-max-hold-seconds", type=float, default=float(os.getenv("PERPCRAB_PAPER_MAX_HOLD_SECONDS", os.getenv("PUMPCRAB_PAPER_MAX_HOLD_SECONDS", "1800"))))
@@ -806,6 +842,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    args.kelly_fraction = clamp(args.kelly_fraction, 0.0, 1.0)
+    args.min_risk_bps = max(1.0, args.min_risk_bps)
+    args.max_risk_bps = max(args.min_risk_bps, args.max_risk_bps)
+
     args.paper_take_profit_bps = abs(args.paper_take_profit_bps)
     args.paper_stop_loss_bps = -abs(args.paper_stop_loss_bps)
     args.paper_min_hold_seconds = max(0.0, args.paper_min_hold_seconds)
@@ -821,9 +861,16 @@ def main() -> int:
             "target_win_rate": 0.55,
             "max_drawdown_bps": 1200,
             "lookback_trades": 30,
+            "kelly_fraction": 0.25,
+            "min_risk_bps": 25,
+            "max_risk_bps": 1000,
             "updated_at": None,
         },
     )
+
+    state["kelly_fraction"] = round(args.kelly_fraction, 4)
+    state["min_risk_bps"] = round(args.min_risk_bps, 2)
+    state["max_risk_bps"] = round(args.max_risk_bps, 2)
 
     history = load_history(HISTORY_PATH)
 

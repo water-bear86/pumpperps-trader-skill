@@ -90,7 +90,7 @@ Each run updates `data/strategy_state.json` based on realized `closed` entries i
 Paper mode now keeps open positions in `data/paper_positions.json` and only learns once they close:
 
 - `max_leverage`
-- `risk_per_trade_bps`
+- `risk_per_trade_bps` (fractional Kelly sized, capped)
 - `min_signal_score`
 
 Run adaptation only:
@@ -98,6 +98,17 @@ Run adaptation only:
 ```bash
 python3 scripts/trader_loop.py --improve-only
 ```
+
+Kelly sizing controls:
+
+```bash
+python3 scripts/trader_loop.py --improve-only \
+  --kelly-fraction 0.25 \
+  --min-risk-bps 25 \
+  --max-risk-bps 1000
+```
+
+Formula used on rolling closed trades: `f* = W - (1-W)/R`, then fractional Kelly and safety caps.
 
 ### Files
 
