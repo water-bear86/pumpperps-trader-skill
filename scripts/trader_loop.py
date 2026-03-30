@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,7 +72,7 @@ def request_json(
     url = base_url.rstrip("/") + route
     headers = {
         "Accept": "application/json",
-        "User-Agent": "pumpcrab/1.2",
+        "User-Agent": "pumpcrab/1.3",
     }
     payload = None
     if body is not None:
@@ -146,17 +147,7 @@ def score_pool(pool: Dict[str, Any]) -> float:
     return liquidity_term * 0.45 + (1.0 - imbalance) * 0.25 + depth_term * 0.30
 
 
-def pick_side(pool: Dict[str, Any]) -> str:
-    long_oi = float(pool.get("longOi") or 0.0)
-    short_oi = float(pool.get("shortOi") or 0.0)
-    if long_oi > short_oi:
-        return "short"
-    if short_oi > long_oi:
-        return "long"
-    return random.choice(["long", "short"])
-
-
-def choose_candidate(pools: List[Dict[str, Any]], min_signal_score: float) -> Optional[Dict[str, Any]]:
+def rank_candidates(pools: List[Dict[str, Any]], min_signal_score: float) -> List[Dict[str, Any]]:
     scored = []
     for pool in pools:
         s = score_pool(pool)
@@ -164,10 +155,8 @@ def choose_candidate(pools: List[Dict[str, Any]], min_signal_score: float) -> Op
             row = dict(pool)
             row["signal_score"] = s
             scored.append(row)
-    if not scored:
-        return None
     scored.sort(key=lambda p: float(p["signal_score"]), reverse=True)
-    return scored[0]
+    return scored
 
 
 def improve(state: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -264,6 +253,126 @@ def get_positions(
     return []
 
 
+def parse_json_object(text: str) -> Dict[str, Any]:
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z0-9_-]*\\n", "", raw)
+        raw = re.sub(r"\\n```$", "", raw)
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("LLM response was not a JSON object")
+    return parsed
+
+
+def llm_trade_decision(
+    args: argparse.Namespace,
+    state: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    paper_mode: bool,
+) -> Dict[str, Any]:
+    api_key = args.llm_api_key
+    if not api_key:
+        raise RuntimeError("LLM decision required but PUMPCRAB_OPENAI_API_KEY / OPENAI_API_KEY is missing")
+
+    if not candidates:
+        raise RuntimeError("No candidates available for LLM decision")
+
+    compact = []
+    for c in candidates:
+        compact.append(
+            {
+                "tokenMint": c.get("tokenMint"),
+                "tokenTicker": c.get("tokenTicker"),
+                "signal_score": round(float(c.get("signal_score") or 0.0), 4),
+                "volume24h": float(c.get("volume24h") or c.get("volume") or 0.0),
+                "longOi": float(c.get("longOi") or 0.0),
+                "shortOi": float(c.get("shortOi") or 0.0),
+                "tvl": float(c.get("tvl") or 0.0),
+            }
+        )
+
+    system_prompt = (
+        "You are a strict trading policy model. Choose exactly one candidate and one side. "
+        "Return ONLY JSON with keys: tokenMint, side, confidence, rationale. "
+        "side must be long or short. confidence must be 0..1."
+    )
+    user_payload = {
+        "mode": "paper" if paper_mode else "live",
+        "strategy_state": {
+            "max_leverage": state.get("max_leverage"),
+            "risk_per_trade_bps": state.get("risk_per_trade_bps"),
+            "min_signal_score": state.get("min_signal_score"),
+            "target_win_rate": state.get("target_win_rate"),
+        },
+        "candidates": compact,
+        "instruction": "Pick one candidate tokenMint from candidates and a side.",
+    }
+
+    body = {
+        "model": args.llm_model,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload)},
+        ],
+    }
+
+    endpoint = args.llm_api_base.rstrip("/") + "/chat/completions"
+    req = request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "pumpcrab/1.3",
+        },
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=args.llm_timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            payload = json.loads(raw)
+    except error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"LLM HTTP {exc.code}: {raw[:500]}") from exc
+    except (error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"LLM request failed: {exc}") from exc
+
+    try:
+        content = payload["choices"][0]["message"]["content"]
+        decision = parse_json_object(content)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid LLM response shape: {exc}") from exc
+
+    token_mint = decision.get("tokenMint")
+    side = str(decision.get("side") or "").lower()
+    confidence = decision.get("confidence")
+    rationale = str(decision.get("rationale") or "")
+
+    allowed_mints = {str(c.get("tokenMint")) for c in candidates if c.get("tokenMint")}
+    if token_mint not in allowed_mints:
+        raise RuntimeError("LLM selected tokenMint outside allowed candidate set")
+    if side not in {"long", "short"}:
+        raise RuntimeError("LLM side must be long or short")
+
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        raise RuntimeError("LLM confidence must be numeric")
+    if conf < 0.0 or conf > 1.0:
+        raise RuntimeError("LLM confidence must be between 0 and 1")
+
+    return {
+        "tokenMint": token_mint,
+        "side": side,
+        "confidence": round(conf, 4),
+        "rationale": rationale[:400],
+    }
+
+
 def maybe_close_positions(
     base_url: str,
     wallet: str,
@@ -317,6 +426,7 @@ def resolve_pool_id(base_url: str, candidate: Dict[str, Any]) -> Optional[str]:
 def open_position(
     base_url: str,
     wallet: str,
+    side: str,
     cookie: Optional[str],
     candidate: Dict[str, Any],
     state: Dict[str, Any],
@@ -326,7 +436,6 @@ def open_position(
 ) -> Dict[str, Any]:
     collateral = round(max(5.0, float(state.get("risk_per_trade_bps", 100)) / 10.0), 2)
     leverage = int(state.get("max_leverage", 3))
-    side = pick_side(candidate)
     pool_id = resolve_pool_id(base_url, candidate)
 
     if not pool_id:
@@ -361,7 +470,7 @@ def open_position(
     return payload
 
 
-def record_paper_trade(candidate: Dict[str, Any], payload: Dict[str, Any]) -> None:
+def record_paper_trade(candidate: Dict[str, Any], payload: Dict[str, Any], decision: Dict[str, Any], llm_model: str) -> None:
     score = float(candidate.get("signal_score") or 0.5)
     leverage = float(payload.get("leverage") or 1.0)
     collateral = float(payload.get("collateral") or 0.0)
@@ -389,6 +498,9 @@ def record_paper_trade(candidate: Dict[str, Any], payload: Dict[str, Any]) -> No
         "signal_score": round(score, 4),
         "pnl_bps": round(pnl_bps, 2),
         "pnl_usd": pnl_usd,
+        "llm_model": llm_model,
+        "llm_confidence": decision.get("confidence"),
+        "llm_rationale": decision.get("rationale"),
     }
     append_history(HISTORY_PATH, row)
     print(
@@ -443,26 +555,36 @@ def record_live_close_trade(position: Dict[str, Any]) -> None:
 def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wallet: str) -> None:
     pools = get_pools(args.base_url, args.request_timeout, args.request_retries)
     if not pools:
-        print("no pools returned from API")
-        return
+        raise RuntimeError("no pools returned from API")
 
-    candidate = choose_candidate(pools, float(state.get("min_signal_score", 0.55)))
-    if not candidate:
-        print("no pool passed min_signal_score")
-        return
+    ranked = rank_candidates(pools, float(state.get("min_signal_score", 0.55)))
+    if not ranked:
+        raise RuntimeError("no pool passed min_signal_score")
+
+    candidates = ranked[: max(1, args.llm_candidate_count)]
+    decision = llm_trade_decision(args, state, candidates, paper_mode)
+
+    selected = None
+    for c in candidates:
+        if str(c.get("tokenMint")) == decision["tokenMint"]:
+            selected = c
+            break
+    if selected is None:
+        raise RuntimeError("LLM selected candidate not found after validation")
 
     print(
-        "candidate:",
-        candidate.get("tokenTicker") or candidate.get("tokenName") or candidate.get("tokenMint"),
-        "signal_score=",
-        round(float(candidate.get("signal_score", 0.0)), 4),
+        "llm decision:",
+        f"token={decision['tokenMint']}",
+        f"side={decision['side']}",
+        f"confidence={decision['confidence']}",
     )
 
     opened_payload = open_position(
         base_url=args.base_url,
         wallet=wallet,
+        side=decision["side"],
         cookie=args.cookie,
-        candidate=candidate,
+        candidate=selected,
         state=state,
         dry_run=paper_mode,
         request_timeout=args.request_timeout,
@@ -470,7 +592,7 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wal
     )
 
     if paper_mode:
-        record_paper_trade(candidate, opened_payload)
+        record_paper_trade(selected, opened_payload, decision, args.llm_model)
 
     if args.cookie and not paper_mode:
         maybe_close_positions(
@@ -484,7 +606,7 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wal
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pumpcrab trading loop for PumpPerps with adaptive parameter tuning")
+    parser = argparse.ArgumentParser(description="Pumpcrab trading loop for PumpPerps with mandatory LLM decisions")
     parser.add_argument("--base-url", default=os.getenv("PUMPCRAB_BASE_URL", os.getenv("PUMPPERPS_BASE_URL", "https://pumpperps.com")))
     parser.add_argument("--cookie", default=os.getenv("PUMPCRAB_COOKIE", os.getenv("PUMPPERPS_COOKIE")))
     parser.add_argument("--wallet", default=os.getenv("PUMPCRAB_WALLET", os.getenv("PUMPPERPS_WALLET", "")))
@@ -496,6 +618,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Force paper mode even when --live is passed")
     parser.add_argument("--improve-only", action="store_true")
     parser.add_argument("--record-sample", action="store_true", help="append a synthetic closed trade sample for testing adaptation")
+
+    parser.add_argument("--llm-model", default=os.getenv("PUMPCRAB_LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")))
+    parser.add_argument("--llm-api-base", default=os.getenv("PUMPCRAB_LLM_API_BASE", "https://api.openai.com/v1"))
+    parser.add_argument("--llm-api-key", default=os.getenv("PUMPCRAB_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")))
+    parser.add_argument("--llm-timeout", type=float, default=float(os.getenv("PUMPCRAB_LLM_TIMEOUT", "25")))
+    parser.add_argument("--llm-candidate-count", type=int, default=int(os.getenv("PUMPCRAB_LLM_CANDIDATE_COUNT", "12")))
     return parser.parse_args()
 
 
@@ -557,15 +685,27 @@ def main() -> int:
 
     print(f"mode={'paper' if paper_mode else 'live'}")
 
+    consecutive_failures = 0
+    halted = False
     for i in range(max(1, args.cycles)):
         print(f"cycle {i + 1}/{args.cycles} @ {now_iso()}")
-        cycle(args, state, paper_mode, wallet)
+        try:
+            cycle(args, state, paper_mode, wallet)
+        except RuntimeError as exc:
+            consecutive_failures += 1
+            print(f"cycle failure {consecutive_failures}/3: {exc}")
+            if consecutive_failures > 2:
+                print("stopping trader loop: more than two consecutive failures")
+                halted = True
+                break
+        else:
+            consecutive_failures = 0
         time.sleep(max(args.sleep_seconds, 0))
 
     new_state = improve(state, load_history(HISTORY_PATH))
     save_json(STATE_PATH, new_state)
     print("saved strategy state")
-    return 0
+    return 1 if halted else 0
 
 
 if __name__ == "__main__":
