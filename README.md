@@ -36,6 +36,7 @@ python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10
 ```
 
 The dashboard flow prompts for missing LLM key, wallet, cookie, and Kelly aggressiveness unless `--no-prompts` is passed.
+When launched with default paper risk settings, dashboard mode auto-enables a faster activity profile so entries/exits happen sooner.
 
 ### Dashboard Mode
 
@@ -65,6 +66,7 @@ Dashboard shows:
 - Recent closed positions (TP/SL/time-stop/hard-stop reason and final PnL)
 - Win/loss and win-rate
 - Latest LLM reasoning output
+- Per-cycle activity counters and recent event log
 
 ### Switch LLM Model
 

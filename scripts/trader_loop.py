@@ -197,6 +197,32 @@ def prompt_runtime_setup(args: argparse.Namespace, paper_mode: bool) -> None:
             pass
 
 
+def parse_cycle_output(cycle_output: str) -> Tuple[str, Dict[str, int], List[str]]:
+    lines = [ln.strip() for ln in cycle_output.splitlines() if ln.strip()]
+    activity = {"opened": 0, "closed": 0, "skipped": 0, "errors": 0}
+    events: List[str] = []
+
+    for line in lines:
+        low = line.lower()
+        if "opened simulated position" in low:
+            activity["opened"] += 1
+            events.append(line)
+        elif "closed simulated trade" in low or "closed positions this cycle" in low:
+            activity["closed"] += 1
+            events.append(line)
+        elif "skipping" in low or "already open" in low:
+            activity["skipped"] += 1
+            events.append(line)
+        elif "failure" in low or "error" in low:
+            activity["errors"] += 1
+            events.append(line)
+        elif line.startswith("llm decision:"):
+            events.append(line)
+
+    headline = events[-1] if events else (lines[-1] if lines else "")
+    return headline, activity, events[-6:]
+
+
 def render_dashboard(
     args: argparse.Namespace,
     state: Dict[str, Any],
@@ -207,6 +233,8 @@ def render_dashboard(
     last_event: str = "",
     last_error: str = "",
     halted: bool = False,
+    cycle_activity: Optional[Dict[str, int]] = None,
+    recent_events: Optional[List[str]] = None,
 ) -> None:
     open_positions = load_paper_positions(PAPER_POSITIONS_PATH)
     history = load_history(HISTORY_PATH)
@@ -229,7 +257,7 @@ def render_dashboard(
             break
 
     if supports_color():
-        print("\033[2J\033[H", end="")
+        print("[2J[H", end="")
 
     mode_label = "paper" if paper_mode else "live"
     header = f"Perpcrab Dashboard | mode={mode_label} | cycle={cycle_index}/{total_cycles} | {now_iso()}"
@@ -248,12 +276,30 @@ def render_dashboard(
     ]
     print(" | ".join(status_bits))
 
+    if cycle_activity is None:
+        cycle_activity = {"opened": 0, "closed": 0, "skipped": 0, "errors": 0}
+    activity_line = (
+        f"activity: opened={cycle_activity.get('opened', 0)} "
+        f"closed={cycle_activity.get('closed', 0)} "
+        f"skipped={cycle_activity.get('skipped', 0)} "
+        f"errors={cycle_activity.get('errors', 0)}"
+    )
+    print(color_text(activity_line, "yellow"))
+
     if last_error:
         print(color_text(f"last_error: {last_error}", "red"))
     elif last_event:
         print(color_text(f"last_event: {last_event}", "cyan"))
     elif halted:
         print(color_text("loop halted due to consecutive failures", "red"))
+
+    print()
+    print(color_text("Recent Events", "bold"))
+    if recent_events:
+        for ev in recent_events[-6:]:
+            print(color_text(f"- {ev}", "dim"))
+    else:
+        print(color_text("(no events yet)", "dim"))
 
     print()
     print(color_text("Open Positions", "bold"))
@@ -970,12 +1016,25 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wal
     if paper_mode:
         max_open_positions = max(1, int(args.paper_max_open_positions))
         selected_token = str(selected.get("tokenMint") or "")
+        open_tokens = {str(p.get("tokenMint")) for p in open_positions if p.get("tokenMint")}
+
         if len(open_positions) >= max_open_positions:
             print(f"[paper] max open positions reached ({len(open_positions)}/{max_open_positions}); skipping entry")
             return
-        if selected_token and any(str(p.get("tokenMint")) == selected_token for p in open_positions):
-            print(f"[paper] token already open token={selected_token}; skipping duplicate entry")
-            return
+
+        if selected_token and selected_token in open_tokens:
+            alternate = None
+            for candidate in candidates:
+                candidate_token = str(candidate.get("tokenMint") or "")
+                if candidate_token and candidate_token not in open_tokens:
+                    alternate = candidate
+                    break
+            if alternate is None:
+                print(f"[paper] token already open token={selected_token}; no alternate candidate available")
+                return
+            selected = alternate
+            selected_token = str(selected.get("tokenMint") or "")
+            print(f"[paper] selected token already open; using alternate token={selected_token}")
 
     opened_payload = open_position(
         base_url=args.base_url,
@@ -1062,6 +1121,22 @@ def main() -> int:
     args.paper_max_hold_seconds = max(args.paper_min_hold_seconds, args.paper_max_hold_seconds)
     args.paper_max_open_positions = max(1, args.paper_max_open_positions)
 
+    auto_fast_profile = False
+    if (
+        args.dashboard
+        and args.paper_min_hold_seconds >= 90
+        and args.paper_max_hold_seconds >= 1800
+        and args.paper_take_profit_bps >= 600
+        and abs(args.paper_stop_loss_bps) >= 400
+        and args.paper_max_open_positions <= 3
+    ):
+        args.paper_min_hold_seconds = 20
+        args.paper_max_hold_seconds = 300
+        args.paper_take_profit_bps = 250
+        args.paper_stop_loss_bps = -180
+        args.paper_max_open_positions = 5
+        auto_fast_profile = True
+
     state = load_json(
         STATE_PATH,
         {
@@ -1128,6 +1203,9 @@ def main() -> int:
     if not args.dashboard:
         print(f"mode={'paper' if paper_mode else 'live'}")
     else:
+        initial_event = "interactive setup complete"
+        if auto_fast_profile:
+            initial_event += " | dashboard fast profile enabled"
         render_dashboard(
             args,
             state,
@@ -1135,7 +1213,7 @@ def main() -> int:
             wallet,
             cycle_index=0,
             total_cycles=total_cycles,
-            last_event="interactive setup complete",
+            last_event=initial_event,
         )
 
     consecutive_failures = 0
@@ -1143,6 +1221,8 @@ def main() -> int:
     last_event = ""
     last_error = ""
     current_cycle = 0
+    cycle_activity = {"opened": 0, "closed": 0, "skipped": 0, "errors": 0}
+    recent_events: List[str] = []
 
     for i in range(total_cycles):
         current_cycle = i + 1
@@ -1150,6 +1230,7 @@ def main() -> int:
             print(f"cycle {current_cycle}/{args.cycles} @ {now_iso()}")
 
         last_error = ""
+        cycle_activity = {"opened": 0, "closed": 0, "skipped": 0, "errors": 0}
         try:
             if args.dashboard:
                 cycle_buffer = io.StringIO()
@@ -1157,14 +1238,21 @@ def main() -> int:
                     cycle(args, state, paper_mode, wallet)
                 cycle_output = cycle_buffer.getvalue().strip()
                 if cycle_output:
-                    last_event = cycle_output.splitlines()[-1]
+                    headline, cycle_activity, cycle_events = parse_cycle_output(cycle_output)
+                    last_event = headline
+                    recent_events.extend(cycle_events)
+                    recent_events = recent_events[-20:]
             else:
                 cycle(args, state, paper_mode, wallet)
         except RuntimeError as exc:
             consecutive_failures += 1
             last_error = str(exc)
+            cycle_activity["errors"] += 1
             if not args.dashboard:
                 print(f"cycle failure {consecutive_failures}/3: {exc}")
+            else:
+                recent_events.append(f"cycle failure {consecutive_failures}/3: {exc}")
+                recent_events = recent_events[-20:]
             if consecutive_failures > 2:
                 if not args.dashboard:
                     print("stopping trader loop: more than two consecutive failures")
@@ -1183,6 +1271,8 @@ def main() -> int:
                 last_event=last_event,
                 last_error=last_error,
                 halted=halted,
+                cycle_activity=cycle_activity,
+                recent_events=recent_events,
             )
 
         if halted:
@@ -1194,6 +1284,8 @@ def main() -> int:
     new_state = improve(state, load_history(HISTORY_PATH))
     save_json(STATE_PATH, new_state)
     if args.dashboard:
+        recent_events.append("saved strategy state")
+        recent_events = recent_events[-20:]
         render_dashboard(
             args,
             new_state,
@@ -1203,6 +1295,8 @@ def main() -> int:
             total_cycles=total_cycles,
             last_event="saved strategy state",
             halted=halted,
+            cycle_activity=cycle_activity,
+            recent_events=recent_events,
         )
     else:
         print("saved strategy state")
