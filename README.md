@@ -103,6 +103,21 @@ python3 scripts/trader_loop.py --cycles 1
 python3 scripts/trader_loop.py --cycles 9999 --sleep-seconds 15
 ```
 
+### Directional Balance (Long/Short)
+
+Perpcrab now enforces side balance so shorts are actually taken over time.
+
+- `--min-short-ratio` (default `0.25`)
+- `--side-balance-window` (default `6`)
+
+Example:
+
+```bash
+python3 scripts/summon_dashboard.py \
+  --min-short-ratio 0.35 \
+  --side-balance-window 8
+```
+
 ### Program SL/TP Ahead Of Time
 
 Yes. You can preconfigure paper risk controls before starting the loop:

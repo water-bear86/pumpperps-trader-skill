@@ -396,7 +396,7 @@ def parse_cycle_output(cycle_output: str) -> Tuple[str, Dict[str, int], List[str
         elif "failure" in low or "error" in low:
             activity["errors"] += 1
             events.append(line)
-        elif line.startswith("llm decision:"):
+        elif line.startswith("llm decision:") or line.startswith("llm policy override:"):
             events.append(line)
 
     headline = events[-1] if events else (lines[-1] if lines else "")
@@ -863,6 +863,47 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     return parsed
 
 
+def recent_side_mix(window: int) -> Dict[str, Any]:
+    w = max(1, int(window))
+
+    history = load_history(HISTORY_PATH)
+    closed = [x for x in history if x.get("status") == "closed"]
+    recent_closed = closed[-w:]
+
+    closed_long = 0
+    closed_short = 0
+    for row in recent_closed:
+        side = str(row.get("side") or "").lower()
+        if side == "long":
+            closed_long += 1
+        elif side == "short":
+            closed_short += 1
+
+    open_positions = load_paper_positions(PAPER_POSITIONS_PATH)
+    open_long = 0
+    open_short = 0
+    for row in open_positions:
+        side = str(row.get("side") or "").lower()
+        if side == "long":
+            open_long += 1
+        elif side == "short":
+            open_short += 1
+
+    total = closed_long + closed_short + open_long + open_short
+    short_total = closed_short + open_short
+    short_ratio = (short_total / total) if total else 0.5
+
+    return {
+        "window": w,
+        "sample_size": total,
+        "closed_long": closed_long,
+        "closed_short": closed_short,
+        "open_long": open_long,
+        "open_short": open_short,
+        "short_ratio": short_ratio,
+    }
+
+
 def llm_trade_decision(
     args: argparse.Namespace,
     state: Dict[str, Any],
@@ -876,22 +917,45 @@ def llm_trade_decision(
     if not candidates:
         raise RuntimeError("No candidates available for LLM decision")
 
+    side_mix = recent_side_mix(args.side_balance_window)
+    force_short = (
+        args.min_short_ratio > 0
+        and side_mix["sample_size"] >= args.side_balance_window
+        and side_mix["short_ratio"] < args.min_short_ratio
+    )
+
     compact = []
     for c in candidates:
+        long_oi = float(c.get("longOi") or 0.0)
+        short_oi = float(c.get("shortOi") or 0.0)
+        oi_total = max(long_oi + short_oi, 1.0)
+        oi_skew = (long_oi - short_oi) / oi_total
+        if oi_skew > 0.12:
+            crowding_side = "long"
+        elif oi_skew < -0.12:
+            crowding_side = "short"
+        else:
+            crowding_side = "neutral"
+
         compact.append(
             {
                 "tokenMint": c.get("tokenMint"),
                 "tokenTicker": c.get("tokenTicker"),
                 "signal_score": round(float(c.get("signal_score") or 0.0), 4),
                 "volume24h": float(c.get("volume24h") or c.get("volume") or 0.0),
-                "longOi": float(c.get("longOi") or 0.0),
-                "shortOi": float(c.get("shortOi") or 0.0),
+                "longOi": long_oi,
+                "shortOi": short_oi,
+                "oiSkew": round(oi_skew, 4),
+                "crowdingSide": crowding_side,
                 "tvl": float(c.get("tvl") or 0.0),
             }
         )
 
     system_prompt = (
-        "You are a strict trading policy model. Choose exactly one candidate and one side. "
+        "You are a perp futures trader and risk manager. Choose exactly one candidate and one side. "
+        "Prioritize liquid setups, avoid one-sided crowding, and include asymmetric invalidation logic. "
+        "When long OI is crowded, short setups are preferred; when short OI is crowded, long setups are preferred. "
+        "Balance directional exposure over time; do not default to long. "
         "Return ONLY JSON with keys: tokenMint, side, confidence, rationale. "
         "side must be long or short. confidence must be 0..1."
     )
@@ -903,8 +967,22 @@ def llm_trade_decision(
             "min_signal_score": state.get("min_signal_score"),
             "target_win_rate": state.get("target_win_rate"),
         },
+        "side_balance": {
+            "window": side_mix["window"],
+            "sample_size": side_mix["sample_size"],
+            "short_ratio": round(float(side_mix["short_ratio"]), 4),
+            "min_short_ratio": args.min_short_ratio,
+            "force_short": force_short,
+            "open_long": side_mix["open_long"],
+            "open_short": side_mix["open_short"],
+            "closed_long": side_mix["closed_long"],
+            "closed_short": side_mix["closed_short"],
+        },
         "candidates": compact,
-        "instruction": "Pick one candidate tokenMint from candidates and a side.",
+        "instruction": (
+            "Pick one candidate tokenMint from candidates and a side for perp futures trading. "
+            "If force_short=true, side must be short."
+        ),
     }
 
     base_body = {
@@ -979,6 +1057,14 @@ def llm_trade_decision(
         raise RuntimeError("LLM selected tokenMint outside allowed candidate set")
     if side not in {"long", "short"}:
         raise RuntimeError("LLM side must be long or short")
+
+    if force_short and side != "short":
+        print(
+            "llm policy override:",
+            f"forcing short side (short_ratio={side_mix["short_ratio"]:.2f} < min={args.min_short_ratio:.2f})",
+        )
+        side = "short"
+        rationale = (rationale + " | side balance override: short required").strip(" |")
 
     try:
         conf = float(confidence)
@@ -1400,6 +1486,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-timeout", type=float, default=float(os.getenv("PERPCRAB_LLM_TIMEOUT", os.getenv("PUMPCRAB_LLM_TIMEOUT", "25"))))
     parser.add_argument("--llm-candidate-count", type=int, default=int(os.getenv("PERPCRAB_LLM_CANDIDATE_COUNT", os.getenv("PUMPCRAB_LLM_CANDIDATE_COUNT", "12"))))
 
+    parser.add_argument("--min-short-ratio", type=float, default=float(os.getenv("PERPCRAB_MIN_SHORT_RATIO", os.getenv("PUMPCRAB_MIN_SHORT_RATIO", "0.25"))), help="minimum target short share across recent+open positions")
+    parser.add_argument("--side-balance-window", type=int, default=int(os.getenv("PERPCRAB_SIDE_BALANCE_WINDOW", os.getenv("PUMPCRAB_SIDE_BALANCE_WINDOW", "6"))), help="rolling sample size used for side-balance policy")
+
     parser.add_argument("--kelly-fraction", type=float, default=float(os.getenv("PERPCRAB_KELLY_FRACTION", os.getenv("PUMPCRAB_KELLY_FRACTION", "0.25"))))
     parser.add_argument("--min-risk-bps", type=float, default=float(os.getenv("PERPCRAB_MIN_RISK_BPS", os.getenv("PUMPCRAB_MIN_RISK_BPS", "25"))))
     parser.add_argument("--max-risk-bps", type=float, default=float(os.getenv("PERPCRAB_MAX_RISK_BPS", os.getenv("PUMPCRAB_MAX_RISK_BPS", "1000"))))
@@ -1421,6 +1510,8 @@ def main() -> int:
     args.kelly_fraction = clamp(args.kelly_fraction, 0.0, 1.0)
     args.min_risk_bps = max(1.0, args.min_risk_bps)
     args.max_risk_bps = max(args.min_risk_bps, args.max_risk_bps)
+    args.min_short_ratio = clamp(args.min_short_ratio, 0.0, 1.0)
+    args.side_balance_window = max(1, int(args.side_balance_window))
 
     args.paper_take_profit_bps = abs(args.paper_take_profit_bps)
     args.paper_stop_loss_bps = -abs(args.paper_stop_loss_bps)

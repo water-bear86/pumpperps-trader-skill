@@ -80,6 +80,8 @@ Tune Kelly sizing with:
 - `--kelly-fraction`
 - `--min-risk-bps`
 - `--max-risk-bps`
+- `--min-short-ratio`
+- `--side-balance-window`
 
 ## Dashboard
 
