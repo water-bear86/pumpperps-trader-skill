@@ -14,9 +14,10 @@ A Codex skill and runnable Python loop for PumpPerps automation with strict safe
 
 - Pulls pools from PumpPerps (`/api/pools`)
 - Selects a candidate using simple scoring
-- Produces a paper-trade order payload by default
+- Opens paper positions and tracks them across cycles
+- Applies configurable paper TP/SL/time-stop exits
 - Optionally places live orders only with `--live`
-- Updates strategy parameters from recent trade outcomes
+- Updates strategy parameters from realized trade outcomes
 
 ### Safety model
 
@@ -44,6 +45,21 @@ python3 scripts/trader_loop.py --cycles 1
 python3 scripts/trader_loop.py --cycles 9999 --sleep-seconds 15
 ```
 
+### Program SL/TP Ahead Of Time
+
+Yes. You can preconfigure paper risk controls before starting the loop:
+
+```bash
+python3 scripts/trader_loop.py --dry-run --cycles 9999 --sleep-seconds 10 \
+  --paper-max-open-positions 3 \
+  --paper-min-hold-seconds 90 \
+  --paper-max-hold-seconds 1800 \
+  --paper-take-profit-bps 600 \
+  --paper-stop-loss-bps -400
+```
+
+Env var equivalents are also supported (`PERPCRAB_PAPER_*`, with `PUMPCRAB_PAPER_*` fallback).
+
 ### Long-run paper mode notes
 
 During long paper runs, `/api/pools` may intermittently time out. This is expected and non-fatal.
@@ -70,7 +86,8 @@ python3 scripts/trader_loop.py --live --cycles 1
 
 ### Self-improvement behavior
 
-Each run updates `data/strategy_state.json` based on recent `closed` entries in `data/trade_history.jsonl` from both paper and live trades:
+Each run updates `data/strategy_state.json` based on realized `closed` entries in `data/trade_history.jsonl` from both paper and live trades.
+Paper mode now keeps open positions in `data/paper_positions.json` and only learns once they close:
 
 - `max_leverage`
 - `risk_per_trade_bps`
@@ -88,7 +105,8 @@ python3 scripts/trader_loop.py --improve-only
 - `scripts/trader_loop.py`: runner + adaptation logic
 - `scripts/quick_validate.py`: integrity checks
 - `data/strategy_state.json`: current strategy parameters
-- `data/trade_history.jsonl`: trade outcome history
+- `data/trade_history.jsonl`: realized trade outcome history
+- `data/paper_positions.json`: open paper positions across cycles
 
 ## For Agents
 

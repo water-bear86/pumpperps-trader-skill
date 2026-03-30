@@ -18,6 +18,7 @@ def main() -> int:
         ROOT / "scripts" / "trader_loop.py",
         ROOT / "data" / "strategy_state.json",
         ROOT / "data" / "trade_history.jsonl",
+        ROOT / "data" / "paper_positions.json",
     ]
     for p in required:
         require(p)

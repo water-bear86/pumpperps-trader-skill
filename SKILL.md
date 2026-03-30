@@ -46,7 +46,8 @@ Only after explicit confirmation and credentials:
 
 ## Self-Improvement
 
-- Uses recent closed trades from `data/trade_history.jsonl`.
+- Uses recent realized closed trades from `data/trade_history.jsonl`.
+- Paper positions persist in `data/paper_positions.json` and close via TP/SL/time-stop rules.
 - Updates and persists strategy values in `data/strategy_state.json`:
   - `max_leverage`
   - `risk_per_trade_bps`
@@ -59,3 +60,14 @@ Only after explicit confirmation and credentials:
 - `--live` is required for real order placement.
 - Invalid wallet input in paper mode is ignored and replaced with a placeholder wallet.
 - Live mode rejects invalid wallet or missing cookie.
+
+## Paper Risk Controls
+
+Preconfigure these flags/env vars before running paper mode:
+
+- `--paper-max-open-positions`
+- `--paper-min-hold-seconds`
+- `--paper-max-hold-seconds`
+- `--paper-take-profit-bps`
+- `--paper-stop-loss-bps`
+- `--paper-noise-bps`

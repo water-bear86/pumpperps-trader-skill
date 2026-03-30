@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib import error, parse, request
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +17,7 @@ HISTORY_PATH = DATA_DIR / "trade_history.jsonl"
 POOLS_CACHE_PATH = DATA_DIR / "pools_cache.json"
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 PAPER_WALLET = "PAPER_TRADING_WALLET"
+PAPER_POSITIONS_PATH = DATA_DIR / "paper_positions.json"
 
 
 def now_iso() -> str:
@@ -57,6 +58,51 @@ def append_history(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def load_paper_positions(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("positions"), list):
+        return [x for x in payload["positions"] if isinstance(x, dict)]
+    return []
+
+
+def save_paper_positions(path: Path, positions: List[Dict[str, Any]]) -> None:
+    save_json(path, {"updated_at": now_iso(), "positions": positions})
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_iso_timestamp(value: Any) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def request_json(
@@ -470,46 +516,137 @@ def open_position(
     return payload
 
 
-def record_paper_trade(candidate: Dict[str, Any], payload: Dict[str, Any], decision: Dict[str, Any], llm_model: str) -> None:
-    score = float(candidate.get("signal_score") or 0.5)
-    leverage = float(payload.get("leverage") or 1.0)
-    collateral = float(payload.get("collateral") or 0.0)
-    side = str(payload.get("side") or "long")
-
-    edge_bps = (score - 0.5) * 350.0
-    noise_bps = random.gauss(0.0, 220.0)
-    direction_bps = 20.0 if side == "long" else -20.0
-    pnl_bps = clamp(edge_bps + noise_bps + direction_bps, -1500.0, 1500.0)
-
+def build_paper_position(
+    candidate: Dict[str, Any],
+    payload: Dict[str, Any],
+    decision: Dict[str, Any],
+    llm_model: str,
+) -> Dict[str, Any]:
+    opened_at = now_iso()
+    score = safe_float(candidate.get("signal_score"), 0.5)
+    leverage = max(1.0, safe_float(payload.get("leverage"), 1.0))
+    collateral = max(0.0, safe_float(payload.get("collateral"), 0.0))
     notional = collateral * leverage
-    pnl_usd = round(notional * (pnl_bps / 10000.0), 2)
 
-    row = {
+    return {
         "mode": "paper",
-        "status": "closed",
-        "opened_at": now_iso(),
-        "closed_at": now_iso(),
+        "status": "open",
+        "opened_at": opened_at,
+        "last_eval_at": opened_at,
         "tokenMint": payload.get("tokenMint"),
         "poolId": payload.get("poolId"),
-        "side": side,
-        "collateral": collateral,
-        "leverage": leverage,
+        "side": str(payload.get("side") or "long").lower(),
+        "collateral": round(collateral, 2),
+        "leverage": round(leverage, 4),
         "notional_usd": round(notional, 2),
-        "signal_score": round(score, 4),
-        "pnl_bps": round(pnl_bps, 2),
-        "pnl_usd": pnl_usd,
+        "entry_signal_score": round(score, 4),
+        "unrealized_pnl_bps": 0.0,
+        "unrealized_pnl_usd": 0.0,
         "llm_model": llm_model,
         "llm_confidence": decision.get("confidence"),
         "llm_rationale": decision.get("rationale"),
     }
-    append_history(HISTORY_PATH, row)
-    print(
-        "[paper] closed simulated trade",
-        f"side={side}",
-        f"token={payload.get('tokenMint')}",
-        f"pnl_bps={row['pnl_bps']}",
-        f"pnl_usd={row['pnl_usd']}",
-    )
+
+
+def simulate_paper_unrealized_pnl_bps(position: Dict[str, Any], current_signal_score: float, paper_noise_bps: float) -> float:
+    entry_signal_score = safe_float(position.get("entry_signal_score"), 0.5)
+    market_move_bps = (current_signal_score - entry_signal_score) * 1800.0 + random.gauss(0.0, paper_noise_bps)
+    side = str(position.get("side") or "long").lower()
+    pnl_bps = market_move_bps if side == "long" else -market_move_bps
+    return clamp(pnl_bps, -2500.0, 2500.0)
+
+
+def evaluate_and_close_paper_positions(
+    args: argparse.Namespace,
+    open_positions: List[Dict[str, Any]],
+    pool_by_token: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    now_dt = datetime.now(timezone.utc)
+    take_profit_bps = abs(safe_float(args.paper_take_profit_bps, 600.0))
+    stop_loss_bps = -abs(safe_float(args.paper_stop_loss_bps, -400.0))
+    min_hold_seconds = max(0.0, safe_float(args.paper_min_hold_seconds, 90.0))
+    max_hold_seconds = max(min_hold_seconds, safe_float(args.paper_max_hold_seconds, 1800.0))
+
+    remaining: List[Dict[str, Any]] = []
+    closed_count = 0
+
+    for position in open_positions:
+        token_mint = str(position.get("tokenMint") or "")
+        opened_at = position.get("opened_at") or now_iso()
+        opened_dt = parse_iso_timestamp(opened_at)
+        age_seconds = max(0.0, (now_dt - opened_dt).total_seconds())
+
+        pool = pool_by_token.get(token_mint)
+        if pool is None:
+            current_signal_score = safe_float(position.get("entry_signal_score"), 0.5)
+        else:
+            current_signal_score = score_pool(pool)
+
+        pnl_bps = simulate_paper_unrealized_pnl_bps(position, current_signal_score, args.paper_noise_bps)
+        notional = max(0.0, safe_float(position.get("notional_usd"), 0.0))
+        pnl_usd = round(notional * (pnl_bps / 10000.0), 2)
+
+        position["last_eval_at"] = now_iso()
+        position["age_seconds"] = round(age_seconds, 2)
+        position["current_signal_score"] = round(current_signal_score, 4)
+        position["unrealized_pnl_bps"] = round(pnl_bps, 2)
+        position["unrealized_pnl_usd"] = pnl_usd
+
+        hit_take_profit = pnl_bps >= take_profit_bps
+        hit_stop_loss = pnl_bps <= stop_loss_bps
+        hit_time_stop = age_seconds >= max_hold_seconds
+        hold_matured = age_seconds >= min_hold_seconds
+        hard_stop = pnl_bps <= (stop_loss_bps * 1.5)
+
+        should_close = (hold_matured and (hit_take_profit or hit_stop_loss or hit_time_stop)) or hard_stop
+        if not should_close:
+            remaining.append(position)
+            continue
+
+        if hard_stop:
+            close_reason = "hard_stop"
+        elif hit_take_profit:
+            close_reason = "take_profit"
+        elif hit_stop_loss:
+            close_reason = "stop_loss"
+        elif hit_time_stop:
+            close_reason = "time_stop"
+        else:
+            close_reason = "rule_close"
+
+        row = {
+            "mode": "paper",
+            "status": "closed",
+            "opened_at": opened_at,
+            "closed_at": now_iso(),
+            "tokenMint": position.get("tokenMint"),
+            "poolId": position.get("poolId"),
+            "side": position.get("side"),
+            "collateral": round(safe_float(position.get("collateral"), 0.0), 2),
+            "leverage": round(safe_float(position.get("leverage"), 1.0), 4),
+            "notional_usd": round(notional, 2),
+            "signal_score": round(safe_float(position.get("entry_signal_score"), 0.5), 4),
+            "exit_signal_score": round(current_signal_score, 4),
+            "pnl_bps": round(pnl_bps, 2),
+            "pnl_usd": pnl_usd,
+            "close_reason": close_reason,
+            "holding_seconds": round(age_seconds, 2),
+            "llm_model": position.get("llm_model"),
+            "llm_confidence": position.get("llm_confidence"),
+            "llm_rationale": position.get("llm_rationale"),
+        }
+        append_history(HISTORY_PATH, row)
+        closed_count += 1
+        print(
+            "[paper] closed simulated trade",
+            f"side={row['side']}",
+            f"token={row['tokenMint']}",
+            f"pnl_bps={row['pnl_bps']}",
+            f"pnl_usd={row['pnl_usd']}",
+            f"reason={close_reason}",
+        )
+
+    return remaining, closed_count
 
 
 def record_live_close_trade(position: Dict[str, Any]) -> None:
@@ -561,6 +698,20 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wal
     if not ranked:
         raise RuntimeError("no pool passed min_signal_score")
 
+    pool_by_token: Dict[str, Dict[str, Any]] = {}
+    for pool in pools:
+        token_mint = pool.get("tokenMint") or pool.get("mint")
+        if token_mint:
+            pool_by_token[str(token_mint)] = pool
+
+    open_positions: List[Dict[str, Any]] = []
+    if paper_mode:
+        open_positions = load_paper_positions(PAPER_POSITIONS_PATH)
+        open_positions, closed_count = evaluate_and_close_paper_positions(args, open_positions, pool_by_token)
+        if closed_count:
+            print(f"[paper] closed positions this cycle: {closed_count}")
+        save_paper_positions(PAPER_POSITIONS_PATH, open_positions)
+
     candidates = ranked[: max(1, args.llm_candidate_count)]
     decision = llm_trade_decision(args, state, candidates, paper_mode)
 
@@ -579,6 +730,16 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wal
         f"confidence={decision['confidence']}",
     )
 
+    if paper_mode:
+        max_open_positions = max(1, int(args.paper_max_open_positions))
+        selected_token = str(selected.get("tokenMint") or "")
+        if len(open_positions) >= max_open_positions:
+            print(f"[paper] max open positions reached ({len(open_positions)}/{max_open_positions}); skipping entry")
+            return
+        if selected_token and any(str(p.get("tokenMint")) == selected_token for p in open_positions):
+            print(f"[paper] token already open token={selected_token}; skipping duplicate entry")
+            return
+
     opened_payload = open_position(
         base_url=args.base_url,
         wallet=wallet,
@@ -592,7 +753,16 @@ def cycle(args: argparse.Namespace, state: Dict[str, Any], paper_mode: bool, wal
     )
 
     if paper_mode:
-        record_paper_trade(selected, opened_payload, decision, args.llm_model)
+        open_position_row = build_paper_position(selected, opened_payload, decision, args.llm_model)
+        open_positions.append(open_position_row)
+        save_paper_positions(PAPER_POSITIONS_PATH, open_positions)
+        print(
+            "[paper] opened simulated position",
+            f"side={open_position_row['side']}",
+            f"token={open_position_row['tokenMint']}",
+            f"open_count={len(open_positions)}",
+        )
+        return
 
     if args.cookie and not paper_mode:
         maybe_close_positions(
@@ -624,11 +794,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-api-key", default=os.getenv("PERPCRAB_OPENAI_API_KEY", os.getenv("PUMPCRAB_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))))
     parser.add_argument("--llm-timeout", type=float, default=float(os.getenv("PERPCRAB_LLM_TIMEOUT", os.getenv("PUMPCRAB_LLM_TIMEOUT", "25"))))
     parser.add_argument("--llm-candidate-count", type=int, default=int(os.getenv("PERPCRAB_LLM_CANDIDATE_COUNT", os.getenv("PUMPCRAB_LLM_CANDIDATE_COUNT", "12"))))
+
+    parser.add_argument("--paper-max-open-positions", type=int, default=int(os.getenv("PERPCRAB_PAPER_MAX_OPEN_POSITIONS", os.getenv("PUMPCRAB_PAPER_MAX_OPEN_POSITIONS", "3"))))
+    parser.add_argument("--paper-min-hold-seconds", type=float, default=float(os.getenv("PERPCRAB_PAPER_MIN_HOLD_SECONDS", os.getenv("PUMPCRAB_PAPER_MIN_HOLD_SECONDS", "90"))))
+    parser.add_argument("--paper-max-hold-seconds", type=float, default=float(os.getenv("PERPCRAB_PAPER_MAX_HOLD_SECONDS", os.getenv("PUMPCRAB_PAPER_MAX_HOLD_SECONDS", "1800"))))
+    parser.add_argument("--paper-take-profit-bps", type=float, default=float(os.getenv("PERPCRAB_PAPER_TAKE_PROFIT_BPS", os.getenv("PUMPCRAB_PAPER_TAKE_PROFIT_BPS", "600"))))
+    parser.add_argument("--paper-stop-loss-bps", type=float, default=float(os.getenv("PERPCRAB_PAPER_STOP_LOSS_BPS", os.getenv("PUMPCRAB_PAPER_STOP_LOSS_BPS", "-400"))))
+    parser.add_argument("--paper-noise-bps", type=float, default=float(os.getenv("PERPCRAB_PAPER_NOISE_BPS", os.getenv("PUMPCRAB_PAPER_NOISE_BPS", "90"))))
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    args.paper_take_profit_bps = abs(args.paper_take_profit_bps)
+    args.paper_stop_loss_bps = -abs(args.paper_stop_loss_bps)
+    args.paper_min_hold_seconds = max(0.0, args.paper_min_hold_seconds)
+    args.paper_max_hold_seconds = max(args.paper_min_hold_seconds, args.paper_max_hold_seconds)
+    args.paper_max_open_positions = max(1, args.paper_max_open_positions)
     state = load_json(
         STATE_PATH,
         {
