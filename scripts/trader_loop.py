@@ -236,6 +236,7 @@ def make_fixed_table_panel(
     min_col_widths: List[int],
     aligns: Optional[List[str]] = None,
     max_rows: int = 6,
+    fill_rows: bool = False,
 ) -> List[str]:
     widths = fit_column_widths(panel_width, min_col_widths)
     col_count = len(widths)
@@ -255,8 +256,9 @@ def make_fixed_table_panel(
     normalized_rows: List[List[Any]] = []
     for row in rows[:max_rows]:
         normalized_rows.append([sanitize_text(row[i] if i < len(row) else "") for i in range(col_count)])
-    while len(normalized_rows) < max_rows:
-        normalized_rows.append(["" for _ in range(col_count)])
+    if fill_rows:
+        while len(normalized_rows) < max_rows:
+            normalized_rows.append(["" for _ in range(col_count)])
 
     body_lines = []
     for row in normalized_rows:
@@ -415,14 +417,14 @@ def render_dashboard(
     recent_events: Optional[List[str]] = None,
 ) -> None:
     term_width = shutil.get_terminal_size(fallback=(120, 40)).columns
-    two_col = term_width >= 108
+    two_col = term_width >= 96
     if two_col:
-        board_width = min(140, max(108, term_width - 1))
+        board_width = min(120, max(96, term_width - 1))
         left_panel_width = (board_width - 3) // 2
         right_panel_width = board_width - 3 - left_panel_width
         full_panel_width = board_width
     else:
-        board_width = min(120, max(88, term_width - 1))
+        board_width = min(100, max(72, term_width - 1))
         left_panel_width = board_width
         right_panel_width = board_width
         full_panel_width = board_width
@@ -467,23 +469,21 @@ def render_dashboard(
         ["mode", mode_label],
         ["cycle", f"{cycle_index}/{total_cycles}"],
         ["wallet", mask_value(wallet)],
+        ["model", args.llm_model],
         ["kelly", state.get("kelly_fraction", args.kelly_fraction)],
         ["risk bps", state.get("risk_per_trade_bps")],
-        ["open positions", len(open_positions)],
-        ["closed trades", total_closed],
-        ["win/loss", f"{wins}/{losses}"],
+        ["open", len(open_positions)],
+        ["w/l", f"{wins}/{losses}"],
         ["win rate", f"{win_rate:.1%}"],
-        ["timestamp", now_iso()],
-        ["error log", str(ERROR_LOG_PATH)],
     ]
     session_panel = make_fixed_table_panel(
         "SESSION",
         ["FIELD", "VALUE"],
         session_rows,
         panel_width=left_panel_width,
-        min_col_widths=[14, 30],
+        min_col_widths=[12, 24],
         aligns=["left", "left"],
-        max_rows=11,
+        max_rows=9,
     )
 
     activity_rows = [
@@ -497,12 +497,12 @@ def render_dashboard(
         ["METRIC", "COUNT"],
         activity_rows,
         panel_width=right_panel_width,
-        min_col_widths=[14, 8],
+        min_col_widths=[10, 6],
         aligns=["left", "right"],
-        max_rows=6,
+        max_rows=4,
     )
 
-    event_items = [sanitize_text(item) for item in list(recent_events or [])[-8:]]
+    event_items = [sanitize_text(item) for item in list(recent_events or [])[-4:]]
     if last_error:
         event_items.append(f"ERROR: {sanitize_text(last_error)}")
     elif last_event:
@@ -510,7 +510,7 @@ def render_dashboard(
     elif halted:
         event_items.append("ERROR: loop halted due to consecutive failures")
 
-    event_rows = [[idx + 1, ev] for idx, ev in enumerate(event_items[-8:])]
+    event_rows = [[idx + 1, ev] for idx, ev in enumerate(event_items[-4:])]
     if not event_rows:
         event_rows = [[1, "(no events yet)"]]
     event_panel = make_fixed_table_panel(
@@ -518,13 +518,13 @@ def render_dashboard(
         ["#", "EVENT"],
         event_rows,
         panel_width=full_panel_width,
-        min_col_widths=[4, 40],
+        min_col_widths=[3, 30],
         aligns=["right", "left"],
-        max_rows=8,
+        max_rows=4,
     )
 
     open_rows: List[List[Any]] = []
-    for pos in open_positions[-10:]:
+    for pos in open_positions[-4:]:
         pnl_bps = safe_float(pos.get("unrealized_pnl_bps"), 0.0)
         pnl_usd = safe_float(pos.get("unrealized_pnl_usd"), 0.0)
         open_rows.append(
@@ -544,13 +544,13 @@ def render_dashboard(
         ["TOKEN", "SIDE", "L", "AGE", "UPNL", "BPS"],
         open_rows,
         panel_width=left_panel_width,
-        min_col_widths=[10, 6, 3, 6, 11, 10],
+        min_col_widths=[8, 5, 2, 5, 9, 8],
         aligns=["left", "left", "right", "right", "right", "right"],
-        max_rows=8,
+        max_rows=4,
     )
 
     closed_rows: List[List[Any]] = []
-    for row in recent_closed:
+    for row in recent_closed[-4:]:
         pnl_usd = safe_float(row.get("pnl_usd"), 0.0)
         pnl_bps = safe_float(row.get("pnl_bps"), 0.0)
         reason = str(row.get("close_reason") or "live_close")
@@ -571,22 +571,22 @@ def render_dashboard(
         ["R", "TOKEN", "REASON", "BPS", "PNL"],
         closed_rows,
         panel_width=right_panel_width,
-        min_col_widths=[3, 10, 12, 8, 12],
+        min_col_widths=[3, 8, 10, 7, 9],
         aligns=["left", "left", "left", "right", "right"],
-        max_rows=8,
+        max_rows=4,
     )
 
     reasoning = latest_rationale if latest_rationale else "(no rationale captured yet)"
     reasoning_lines = wrap_text(reasoning, width=max(20, full_panel_width - 14))
-    reasoning_rows = [[idx + 1, line] for idx, line in enumerate(reasoning_lines[:8])]
+    reasoning_rows = [[idx + 1, line] for idx, line in enumerate(reasoning_lines[:4])]
     reasoning_panel = make_fixed_table_panel(
         "LATEST LLM REASONING",
         ["#", "TEXT"],
         reasoning_rows,
         panel_width=full_panel_width,
-        min_col_widths=[4, 40],
+        min_col_widths=[3, 30],
         aligns=["right", "left"],
-        max_rows=8,
+        max_rows=4,
     )
 
     if two_col:
@@ -608,15 +608,15 @@ def render_dashboard(
 
     if last_error:
         error_lines = wrap_text(sanitize_text(last_error), width=max(20, full_panel_width - 14))
-        error_rows = [[idx + 1, line] for idx, line in enumerate(error_lines[:12])]
+        error_rows = [[idx + 1, line] for idx, line in enumerate(error_lines[:6])]
         error_panel = make_fixed_table_panel(
             "LAST ERROR (FULL)",
             ["#", "TEXT"],
             error_rows,
             panel_width=full_panel_width,
-            min_col_widths=[4, 40],
+            min_col_widths=[3, 30],
             aligns=["right", "left"],
-            max_rows=12,
+            max_rows=6,
         )
         for line in error_panel:
             print(color_text(line, "red"))

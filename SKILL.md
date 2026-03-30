@@ -18,11 +18,11 @@ Use this skill when the user asks to automate or run trading on PumpPerps.
 
 1. Validate setup:
    - `python3 scripts/quick_validate.py`
-2. Start dashboard-driven paper trading immediately:
-   - `python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10`
-3. Let the script prompt for missing settings (LLM key, wallet, cookie, Kelly aggressiveness).
-4. For unattended mode, run:
-   - `python3 scripts/trader_loop.py --dashboard --no-prompts --cycles 9999 --sleep-seconds 10`
+2. Start compact dashboard-driven paper trading immediately:
+   - `python3 scripts/summon_dashboard.py`
+3. Ask for missing settings in chat (LLM key, wallet, cookie, Kelly aggressiveness).
+4. For unattended/agent mode, run:
+   - `python3 scripts/summon_dashboard.py --sleep-seconds 10`
 
 ## Chat Prompts For Missing Info
 
@@ -83,7 +83,7 @@ Tune Kelly sizing with:
 
 ## Dashboard
 
-Use `--dashboard` to render a live colored CLI monitor with:
+Use `python3 scripts/summon_dashboard.py` (or `--dashboard`) to render a compact live CLI monitor with:
 
 - open positions
 - recent closes with TP/SL/time-stop/hard-stop reason

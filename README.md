@@ -32,32 +32,32 @@ A Codex skill and runnable Python loop for PumpPerps automation with strict safe
 ```bash
 cd /tmp/perpcrab
 python3 scripts/quick_validate.py
-python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10
+python3 scripts/summon_dashboard.py
 ```
 
-The dashboard flow prompts for missing LLM key, wallet, cookie, and Kelly aggressiveness unless `--no-prompts` is passed.
+`scripts/summon_dashboard.py` is non-interactive for agents (`--no-prompts` + paper mode). For interactive prompting, run `scripts/trader_loop.py --dashboard` directly.
 When launched with default paper risk settings, dashboard mode auto-enables a faster activity profile so entries/exits happen sooner.
 
 ### Dashboard Mode
 
 ```bash
-python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10
+python3 scripts/summon_dashboard.py
 ```
 
 Common launch commands:
 
 ```bash
 # interactive dashboard (prompts for missing key/wallet/cookie + Kelly aggressiveness)
-python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10
+python3 scripts/summon_dashboard.py
 
 # non-interactive dashboard (for exported env vars / automation)
-python3 scripts/trader_loop.py --dashboard --no-prompts --dry-run --cycles 1000 --sleep-seconds 10
+python3 scripts/summon_dashboard.py --sleep-seconds 10
 
 # DeepSeek Reasoner dashboard
 PERPCRAB_LLM_API_BASE="https://api.deepseek.com/v1" \
 PERPCRAB_OPENAI_API_KEY="YOUR_DEEPSEEK_KEY" \
 PERPCRAB_LLM_MODEL="deepseek-reasoner" \
-python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10
+python3 scripts/summon_dashboard.py
 ```
 
 Dashboard shows:
@@ -82,13 +82,13 @@ Example with env vars:
 PERPCRAB_LLM_API_BASE="https://api.deepseek.com/v1" \
 PERPCRAB_OPENAI_API_KEY="YOUR_KEY" \
 PERPCRAB_LLM_MODEL="deepseek-reasoner" \
-python3 scripts/trader_loop.py --dashboard --cycles 9999 --sleep-seconds 10
+python3 scripts/summon_dashboard.py
 ```
 
 Or override by flags:
 
 ```bash
-python3 scripts/trader_loop.py --dashboard \
+python3 scripts/summon_dashboard.py \
   --llm-api-base "https://api.deepseek.com/v1" \
   --llm-model "deepseek-chat"
 ```
@@ -173,6 +173,7 @@ Formula used on rolling closed trades: `f* = W - (1-W)/R`, then fractional Kelly
 - `SKILL.md`: agent behavior contract
 - `scripts/trader_loop.py`: runner + adaptation logic
 - `scripts/quick_validate.py`: integrity checks
+- `scripts/summon_dashboard.py`: one-command agent dashboard launcher
 - `data/strategy_state.json`: current strategy parameters
 - `data/trade_history.jsonl`: realized trade outcome history
 - `data/paper_positions.json`: open paper positions across cycles
@@ -183,8 +184,8 @@ Formula used on rolling closed trades: `f* = W - (1-W)/R`, then fractional Kelly
 
 1. Run:
    - `python3 scripts/quick_validate.py`
-2. Start paper trading immediately:
-   - `python3 scripts/trader_loop.py --cycles 1`
+2. Start compact paper dashboard immediately:
+   - `python3 scripts/summon_dashboard.py`
 3. Ask for missing details in chat:
    - `Send your Solana public wallet address (base58 public key only, not private key).`
    - `When ready for live mode, send your PumpPerps session cookie string for authenticated API calls.`
